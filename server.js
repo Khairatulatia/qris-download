@@ -53,8 +53,8 @@ app.get("/create-payment", async (req, res) => {
     });
 
   } catch (err) {
-    console.log("ERROR DUITKU:", err.response?.data || err.message);
-    res.status(500).send("Error Duitku");
+    console.log("ERROR DUITKU FULL:", err.response?.data || err.message);
+    res.status(500).json(err.response?.data || { error: err.message });
   }
 });
 
