@@ -2,6 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
+const crypto = require("crypto");
 
 const app = express();
 app.use(express.json());
@@ -9,52 +10,63 @@ app.use(cors());
 
 const PORT = process.env.PORT;
 
-// penyimpanan sementara (gunakan DB kalau mau serius)
+// penyimpanan sementara
 let transactions = {};
 let links = {};
 
-// 🔹 1. Buat QRIS
+// 🔹 1. Create Payment (Duitku)
 app.get("/create-payment", async (req, res) => {
   try {
-    const external_id = "order-" + Date.now();
+    const merchantCode = process.env.DUITKU_MERCHANT_CODE;
+    const apiKey = process.env.DUITKU_API_KEY;
+
+    const paymentAmount = 10000;
+    const merchantOrderId = "order-" + Date.now();
+
+    const signature = crypto
+      .createHash("md5")
+      .update(merchantCode + merchantOrderId + paymentAmount + apiKey)
+      .digest("hex");
 
     const response = await axios.post(
-      "https://api.xendit.co/qr_codes",
+      "https://sandbox.duitku.com/webapi/api/merchant/v2/inquiry",
       {
-        external_id: external_id,
-        type: "DYNAMIC",
-        amount: 10000
-      },
-      {
-        auth: {
-          username: process.env.XENDIT_API_KEY,
-          password: ""
-        }
+        merchantCode,
+        paymentAmount,
+        merchantOrderId,
+        productDetails: "Download File",
+        email: "test@email.com",
+        paymentMethod: "QRIS",
+        callbackUrl: process.env.BASE_URL + "/webhook",
+        returnUrl: process.env.BASE_URL,
+        signature
       }
     );
 
-    transactions[external_id] = {
+    transactions[merchantOrderId] = {
       status: "PENDING"
     };
 
     res.json({
-      external_id,
-      qr_string: response.data.qr_string
+      order_id: merchantOrderId,
+      payment_url: response.data.paymentUrl
     });
 
   } catch (err) {
-    res.status(500).send("Error bikin QR");
+    console.log("ERROR DUITKU:", err.response?.data || err.message);
+    res.status(500).send("Error Duitku");
   }
 });
 
-// 🔹 2. Webhook dari Xendit
+// 🔹 2. Webhook Duitku
 app.post("/webhook", (req, res) => {
   const data = req.body;
 
-  if (data.status === "PAID") {
-    const external_id = data.external_id;
+  console.log("Webhook masuk:", data);
 
-    // generate token
+  if (data.resultCode === "00") {
+    const orderId = data.merchantOrderId;
+
     const token = Math.random().toString(36).substring(2);
 
     links[token] = {
@@ -62,18 +74,18 @@ app.post("/webhook", (req, res) => {
       file: process.env.DRIVE_LINK
     };
 
-    transactions[external_id] = {
+    transactions[orderId] = {
       status: "PAID",
       token: token
     };
 
-    console.log("Payment sukses:", external_id);
+    console.log("Payment sukses:", orderId);
   }
 
   res.send("OK");
 });
 
-// 🔹 3. Cek status pembayaran
+// 🔹 3. Check status
 app.get("/check-status/:id", (req, res) => {
   const id = req.params.id;
 
@@ -84,7 +96,7 @@ app.get("/check-status/:id", (req, res) => {
   res.json(transactions[id]);
 });
 
-// 🔹 4. Download link sekali pakai
+// 🔹 4. Download
 app.get("/download/:token", (req, res) => {
   const token = req.params.token;
 
