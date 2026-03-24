@@ -28,7 +28,7 @@ function generateToken() {
 app.get("/create-payment", async (req, res) => {
   try {
     const orderId = "order-" + Date.now();
-    const grossAmount = 10000;
+    const grossAmount = 2000;
 
     const payload = {
       payment_type: "qris",
