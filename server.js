@@ -8,85 +8,156 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-const PORT = process.env.PORT;
+const PORT = process.env.PORT || 3000;
 
 // penyimpanan sementara
 let transactions = {};
 let links = {};
 
-// 🔹 1. Create Payment (Duitku)
+function getMidtransAuthHeader() {
+  const serverKey = process.env.MIDTRANS_SERVER_KEY;
+  const encoded = Buffer.from(serverKey + ":").toString("base64");
+  return `Basic ${encoded}`;
+}
+
+function generateToken() {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+// 1. Buat pembayaran QRIS
 app.get("/create-payment", async (req, res) => {
   try {
-    const merchantCode = process.env.DUITKU_MERCHANT_CODE;
-    const apiKey = process.env.DUITKU_API_KEY;
+    const orderId = "order-" + Date.now();
+    const grossAmount = 10000;
 
-    const paymentAmount = 10000;
-    const merchantOrderId = "order-" + Date.now();
-
-    const signature = crypto
-      .createHash("md5")
-      .update(merchantCode + merchantOrderId + paymentAmount + apiKey)
-      .digest("hex");
+    const payload = {
+      payment_type: "qris",
+      transaction_details: {
+        order_id: orderId,
+        gross_amount: grossAmount
+      },
+      qris: {
+        acquirer: "gopay"
+      }
+    };
 
     const response = await axios.post(
-      "https://sandbox.duitku.com/webapi/api/merchant/v2/inquiry",
+      "https://api.sandbox.midtrans.com/v2/charge",
+      payload,
       {
-        merchantCode,
-        paymentAmount,
-        merchantOrderId,
-        productDetails: "Download File",
-        email: "test@email.com",
-        paymentMethod: "QRIS",
-        callbackUrl: process.env.BASE_URL + "/webhook",
-        returnUrl: process.env.BASE_URL,
-        signature
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+          "Authorization": getMidtransAuthHeader(),
+          "X-Override-Notification": `${process.env.BASE_URL}/webhook`
+        }
       }
     );
 
-    transactions[merchantOrderId] = {
-      status: "PENDING"
+    transactions[orderId] = {
+      status: "PENDING",
+      midtrans_status: response.data.transaction_status || "pending",
+      token: null
     };
 
-    res.json({
-      order_id: merchantOrderId,
-      payment_url: response.data.paymentUrl
-    });
+    // cari QR string / actions untuk frontend
+    let qrString = response.data.qr_string || null;
+    let qrUrl = null;
 
+    if (Array.isArray(response.data.actions)) {
+      const qrAction = response.data.actions.find(
+        (a) =>
+          a.name === "generate-qr-code" ||
+          a.name === "generate_qr_code" ||
+          (a.url && a.url.includes("qr"))
+      );
+      if (qrAction) {
+        qrUrl = qrAction.url;
+      }
+    }
+
+    res.json({
+      order_id: orderId,
+      transaction_status: response.data.transaction_status,
+      qr_string: qrString,
+      qr_url: qrUrl,
+      raw: response.data
+    });
   } catch (err) {
     const errorData = err.response?.data || { message: err.message };
-    console.log("ERROR DUITKU:", errorData);
+    console.log("ERROR MIDTRANS:", errorData);
     res.status(500).json(errorData);
   }
 });
 
-// 🔹 2. Webhook Duitku
-app.post("/webhook", (req, res) => {
-  const data = req.body;
+// 2. Webhook dari Midtrans
+app.post("/webhook", async (req, res) => {
+  try {
+    const data = req.body;
+    console.log("Webhook Midtrans masuk:", data);
 
-  console.log("Webhook masuk:", data);
+    const orderId = data.order_id;
+    const transactionStatus = data.transaction_status;
+    const fraudStatus = data.fraud_status;
 
-  if (data.resultCode === "00") {
-    const orderId = data.merchantOrderId;
+    if (!transactions[orderId]) {
+      transactions[orderId] = {
+        status: "PENDING",
+        midtrans_status: transactionStatus || "unknown",
+        token: null
+      };
+    }
 
-    const token = Math.random().toString(36).substring(2);
+    // anggap settlement/capture sebagai berhasil
+    if (
+      transactionStatus === "settlement" ||
+      (transactionStatus === "capture" && fraudStatus === "accept")
+    ) {
+      let token = transactions[orderId].token;
 
-    links[token] = {
-      used: false,
-      file: process.env.DRIVE_LINK
-    };
+      if (!token) {
+        token = generateToken();
+        links[token] = {
+          used: false,
+          file: process.env.DRIVE_LINK
+        };
+      }
 
-    transactions[orderId] = {
-      status: "PAID",
-      token: token
-    };
+      transactions[orderId] = {
+        status: "PAID",
+        midtrans_status: transactionStatus,
+        token: token
+      };
 
-    console.log("Payment sukses:", orderId);
+      console.log("Payment sukses:", orderId);
+    } else if (
+      transactionStatus === "expire" ||
+      transactionStatus === "cancel" ||
+      transactionStatus === "deny"
+    ) {
+      transactions[orderId] = {
+        ...(transactions[orderId] || {}),
+        status: "FAILED",
+        midtrans_status: transactionStatus,
+        token: null
+      };
+    } else {
+      transactions[orderId] = {
+        ...(transactions[orderId] || {}),
+        status: "PENDING",
+        midtrans_status: transactionStatus || "pending",
+        token: transactions[orderId].token || null
+      };
+    }
+
+    res.status(200).send("OK");
+  } catch (err) {
+    console.log("WEBHOOK ERROR:", err.message);
+    res.status(500).send("Webhook error");
   }
-
-  res.send("OK");
 });
 
-// 🔹 3. Check status
+// 3. Cek status pembayaran
 app.get("/check-status/:id", (req, res) => {
   const id = req.params.id;
 
@@ -97,7 +168,7 @@ app.get("/check-status/:id", (req, res) => {
   res.json(transactions[id]);
 });
 
-// 🔹 4. Download
+// 4. Download link sekali pakai
 app.get("/download/:token", (req, res) => {
   const token = req.params.token;
 
@@ -106,7 +177,6 @@ app.get("/download/:token", (req, res) => {
   }
 
   links[token].used = true;
-
   res.redirect(links[token].file);
 });
 
